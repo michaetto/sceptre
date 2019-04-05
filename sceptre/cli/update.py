@@ -9,6 +9,8 @@ from sceptre.cli.helpers import simplify_change_set_description
 from sceptre.stack_status import StackChangeSetStatus
 from sceptre.plan.plan import SceptrePlan
 
+from sceptre.plan.executor import SceptrePlanExecutor
+
 
 @click.command(name="update", short_help="Update a stack.")
 @click.argument("path")
@@ -52,31 +54,42 @@ def update_command(ctx, path, change_set, verbose, yes):
     plan = SceptrePlan(context)
 
     if change_set:
-        change_set_name = "-".join(["change-set", uuid1().hex])
-        plan.create_change_set(change_set_name)
-        try:
-            # Wait for change set to be created
-            statuses = plan.wait_for_cs_completion(change_set_name)
-            # Exit if change set fails to create
-            for status in list(statuses.values()):
-                if status != StackChangeSetStatus.READY:
-                    exit(1)
+        plan.resolve(command=plan.create_change_set.__name__)
 
-            # Describe changes
-            descriptions = plan.describe_change_set(change_set_name)
-            for description in list(descriptions.values()):
-                if not verbose:
-                    description = simplify_change_set_description(description)
-                write(description, context.output_format)
+        for batch in plan.launch_order:
+            change_set_name = "-".join(["change-set", uuid1().hex])
+            try:
+                plan_executor = SceptrePlanExecutor(plan.create_change_set.__name__, [batch])
+                plan_executor.execute(change_set_name)
 
-            # Execute change set if happy with changes
-            if yes or click.confirm("Proceed with stack update?"):
-                plan.execute_change_set(change_set_name)
-        except Exception as e:
-            raise e
-        finally:
-            # Clean up by deleting change set
-            plan.delete_change_set(change_set_name)
+                plan_executor = SceptrePlanExecutor(plan.wait_for_cs_completion.__name__, [batch])
+                statuses = plan_executor.execute(change_set_name)
+
+                plan_executor = SceptrePlanExecutor(plan.describe_change_set.__name__, [batch])
+                change_set_descriptions = plan_executor.execute(change_set_name)
+
+                for stack in change_set_descriptions:
+                    stack_change_set_description = change_set_descriptions[stack]
+                    if not verbose:
+                        stack_change_set_description = simplify_change_set_description(stack_change_set_description)
+                        if statuses[stack] != StackChangeSetStatus.READY and not stack_change_set_description["Changes"]:
+                            no_changes_log = "                      - %s No changes in change set: %s" % (stack.name, change_set_name)
+                            write(no_changes_log)
+                            continue
+                    write(stack_change_set_description, context.output_format)
+
+                stacks_to_update = [stack for stack in statuses if statuses[stack] == StackChangeSetStatus.READY and change_set_descriptions[stack]["Changes"]]
+
+                if stacks_to_update:
+                    if yes or click.confirm("Proceed with stack update of %s?" % [x.name for x in stacks_to_update]):
+                        e = SceptrePlanExecutor(plan.execute_change_set.__name__, [stacks_to_update])
+                        e.execute(change_set_name)
+                    else:
+                        exit(1)
+
+            finally:
+                executor = SceptrePlanExecutor(plan.delete_change_set.__name__, [batch])
+                executor.execute(change_set_name)
     else:
         confirmation("update", yes, command_path=path)
         responses = plan.update()
